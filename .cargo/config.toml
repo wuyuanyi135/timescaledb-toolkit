@@ -1,1 +1,5 @@
-config
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "link-args=/FORCE:UNRESOLVED"]
+
+[target.'cfg(all(unix, not(target_os = "macos")))']
+rustflags = ["-C", "link-args=-Wl,-undefined,dynamic_lookup"]
