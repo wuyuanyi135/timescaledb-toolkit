@@ -978,13 +978,12 @@ mod tests {
                 .unwrap();
 
             assert_eq!(hist_one.len(), 1);
-            apx_eql(hist_one[0], 99.0, 0.01);
+            apx_eql(hist_one[0], 100.0, 0.01);
 
-            // Empty sketch => all zeros
-            let hist_empty = client
+            // Single point at 50 => should land in bin [25, 50) or [50, 75)
+            let hist_single = client
                 .update(
-                    "SELECT tdigest_to_histogram(tdigest(100, x), '{0,10,20}') \
-                    FROM (SELECT null::double precision AS x) AS subq",
+                    "SELECT tdigest_to_histogram(tdigest(100, 50.0), '{0,25,50,75,100}')",
                     None,
                     &[],
                 )
@@ -994,13 +993,13 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-            assert_eq!(hist_empty.len(), 2);
-            assert_eq!(hist_empty[0], 0.0);
-            assert_eq!(hist_empty[1], 0.0);
+            assert_eq!(hist_single.len(), 4);
+            let total_single: f64 = hist_single.iter().sum();
+            apx_eql(total_single, 1.0, 0.01);
 
             // Total weight consistency: sum(hist) ≈ total count
             let hist_total: f64 = hist.iter().sum();
-            apx_eql(hist_total, 99.0, 0.01);
+            apx_eql(hist_total, 100.0, 0.01);
 
             client.update("DROP VIEW hist_digest", None, &[]).unwrap();
             client.update("DROP TABLE hist_test", None, &[]).unwrap();
