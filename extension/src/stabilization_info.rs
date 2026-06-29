@@ -14,6 +14,9 @@ crate::functions_stabilized_at! {
     "1.24.0" => {
         eq_op_heartbeat_agg(heartbeatagg, heartbeatagg),
         neq_op_heartbeat_agg(heartbeatagg, heartbeatagg),
+        arrow_tdigest_approx_cdf(tdigest,accessorapproxcdf),
+        tdigest_approx_cdf(double precision,tdigest),
+        approx_cdf(double precision),
     }
     "1.23.0" => {
         stats_agg(bigint),
@@ -908,6 +911,9 @@ crate::functions_stabilized_at! {
 
 crate::types_stabilized_at! {
     STABLE_TYPES
+    "1.24.0" => {
+        accessorapproxcdf,
+    }
     "1.16.0" => {
         accessornumgaps,
         accessornumliveranges,
@@ -1061,6 +1067,7 @@ crate::operators_stabilized_at! {
     "1.24.0" => {
         "="(heartbeatagg, heartbeatagg),
         "<>"(heartbeatagg, heartbeatagg),
+        "->"(tdigest,accessorapproxcdf),
     }
     "1.16.0" => {
         "->"(heartbeatagg,accessornumgaps),

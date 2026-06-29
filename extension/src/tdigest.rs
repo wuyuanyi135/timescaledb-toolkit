@@ -4,8 +4,8 @@ use pgrx::*;
 
 use crate::{
     accessors::{
-        AccessorApproxPercentile, AccessorApproxPercentileRank, AccessorMaxVal, AccessorMean,
-        AccessorMinVal, AccessorNumVals,
+        AccessorApproxCdf, AccessorApproxPercentile, AccessorApproxPercentileRank, AccessorMaxVal,
+        AccessorMean, AccessorMinVal, AccessorNumVals,
     },
     aggregate_utils::in_aggregate_context,
     flatten,
@@ -360,6 +360,22 @@ pub fn arrow_tdigest_approx_rank<'a>(
 // Approximate the quantile at the given value
 #[pg_extern(immutable, parallel_safe, name = "approx_percentile_rank")]
 pub fn tdigest_quantile_at_value<'a>(value: f64, digest: TDigest<'a>) -> f64 {
+    digest
+        .to_internal_tdigest()
+        .estimate_quantile_at_value(value)
+}
+
+#[pg_operator(immutable, parallel_safe)]
+#[opname(->)]
+pub fn arrow_tdigest_approx_cdf<'a>(
+    sketch: TDigest<'a>,
+    accessor: AccessorApproxCdf,
+) -> f64 {
+    tdigest_quantile_at_value(accessor.value, sketch)
+}
+
+#[pg_extern(immutable, parallel_safe, name = "approx_cdf")]
+pub fn tdigest_approx_cdf<'a>(value: f64, digest: TDigest<'a>) -> f64 {
     digest
         .to_internal_tdigest()
         .estimate_quantile_at_value(value)
@@ -759,6 +775,113 @@ mod tests {
 
             apx_eql(test_value.unwrap(), value.unwrap(), 0.1);
             apx_eql(test_value.unwrap(), 9.0, 0.1);
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_approx_cdf() {
+        Spi::connect_mut(|client| {
+            client
+                .update(
+                    "CREATE TABLE cdf_test (data DOUBLE PRECISION)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            client
+                .update(
+                    "INSERT INTO cdf_test SELECT generate_series(0.01, 100, 0.01)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            client
+                .update(
+                    "CREATE VIEW cdf_digest AS \
+                    SELECT tdigest(100, data) FROM cdf_test",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            // CDF at 50: ~50% of data should be <= 50
+            let cdf_at_50 = client
+                .update(
+                    "SELECT approx_cdf(50, tdigest) FROM cdf_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(cdf_at_50, 0.5, 0.01);
+
+            // CDF at 0: near 0
+            let cdf_at_0 = client
+                .update(
+                    "SELECT approx_cdf(0, tdigest) FROM cdf_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(cdf_at_0, 0.0, 0.001);
+
+            // CDF at 100: near 1
+            let cdf_at_100 = client
+                .update(
+                    "SELECT approx_cdf(100, tdigest) FROM cdf_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(cdf_at_100, 1.0, 0.001);
+
+            // CDF range: P(20 < X <= 80) should be ~60%
+            let range_prob = client
+                .update(
+                    "SELECT approx_cdf(80, tdigest) - approx_cdf(20, tdigest) FROM cdf_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(range_prob, 0.6, 0.01);
+
+            // Arrow operator syntax
+            let arrow_cdf = client
+                .update(
+                    "SELECT tdigest -> approx_cdf(50) FROM cdf_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(arrow_cdf, 0.5, 0.01);
+
+            client.update("DROP VIEW cdf_digest", None, &[]).unwrap();
+            client.update("DROP TABLE cdf_test", None, &[]).unwrap();
         });
     }
 }

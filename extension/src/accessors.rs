@@ -53,6 +53,10 @@ accessor! { approx_percentile_rank(
     value: f64,
 ) }
 
+accessor! { approx_cdf(
+    value: f64,
+) }
+
 accessor! { num_vals() }
 accessor! { mean() }
 accessor! { error() }
