@@ -17,6 +17,7 @@ crate::functions_stabilized_at! {
         arrow_tdigest_approx_cdf(tdigest,accessorapproxcdf),
         tdigest_approx_cdf(double precision,tdigest),
         approx_cdf(double precision),
+
     }
     "1.23.0" => {
         stats_agg(bigint),

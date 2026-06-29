@@ -374,6 +374,39 @@ pub fn arrow_tdigest_approx_cdf<'a>(
     tdigest_quantile_at_value(accessor.value, sketch)
 }
 
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_histogram")]
+pub fn tdigest_to_histogram<'a>(sketch: TDigest<'a>, bin_edges: Vec<f64>) -> Vec<f64> {
+    let m = bin_edges.len();
+    if m < 2 || sketch.count == 0 {
+        return vec![0.0_f64; if m > 1 { m - 1 } else { 0 }];
+    }
+    let n_bins = m - 1;
+    let mut hist = vec![0.0_f64; n_bins];
+    let internal = sketch.to_internal_tdigest();
+    for c in internal.raw_centroids() {
+        let mean = c.mean();
+        let weight = c.weight() as f64;
+        let idx = match bin_edges.binary_search_by(|e| e.partial_cmp(&mean).unwrap()) {
+            Ok(i) => {
+                if i >= n_bins {
+                    n_bins - 1
+                } else {
+                    i
+                }
+            }
+            Err(i) => {
+                if i == 0 {
+                    0
+                } else {
+                    i - 1
+                }
+            }
+        };
+        hist[idx] += weight;
+    }
+    hist
+}
+
 #[pg_extern(immutable, parallel_safe, name = "approx_cdf")]
 pub fn tdigest_approx_cdf<'a>(value: f64, digest: TDigest<'a>) -> f64 {
     digest
@@ -882,6 +915,95 @@ mod tests {
 
             client.update("DROP VIEW cdf_digest", None, &[]).unwrap();
             client.update("DROP TABLE cdf_test", None, &[]).unwrap();
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_histogram() {
+        Spi::connect_mut(|client| {
+            // Uniform distribution: 0.01..99.99 step 1 => 100 values
+            client
+                .update(
+                    "CREATE TABLE hist_test (data DOUBLE PRECISION)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            client
+                .update(
+                    "INSERT INTO hist_test SELECT generate_series(0.01, 99.99, 1.0)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            client
+                .update(
+                    "CREATE VIEW hist_digest AS \
+                    SELECT tdigest(100, data) FROM hist_test",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            // 4 equal bins [0, 25, 50, 75, 100] => ~25 each
+            let hist = client
+                .update(
+                    "SELECT tdigest_to_histogram(tdigest, '{0,25,50,75,100}') FROM hist_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(hist.len(), 4);
+            for &h in &hist {
+                apx_eql(h, 25.0, 2.0);
+            }
+
+            // Single bin covers all
+            let hist_one = client
+                .update(
+                    "SELECT tdigest_to_histogram(tdigest, '{0,100}') FROM hist_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(hist_one.len(), 1);
+            apx_eql(hist_one[0], 99.0, 0.01);
+
+            // Empty sketch => all zeros
+            let hist_empty = client
+                .update(
+                    "SELECT tdigest_to_histogram(tdigest(100, x), '{0,10,20}') \
+                    FROM (SELECT null::double precision AS x) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(hist_empty.len(), 2);
+            assert_eq!(hist_empty[0], 0.0);
+            assert_eq!(hist_empty[1], 0.0);
+
+            // Total weight consistency: sum(hist) ≈ total count
+            let hist_total: f64 = hist.iter().sum();
+            apx_eql(hist_total, 99.0, 0.01);
+
+            client.update("DROP VIEW hist_digest", None, &[]).unwrap();
+            client.update("DROP TABLE hist_test", None, &[]).unwrap();
         });
     }
 }
