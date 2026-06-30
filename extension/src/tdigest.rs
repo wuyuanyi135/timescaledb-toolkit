@@ -395,7 +395,7 @@ pub fn arrow_tdigest_approx_percentile<'a>(
     sketch: TDigest<'a>,
     accessor: AccessorApproxPercentile,
 ) -> f64 {
-    tdigest_quantile_2(accessor.percentile, sketch)
+    tdigest_quantile(accessor.percentile, sketch)
 }
 
 // Helper: weighted cumulative weight at a given value
@@ -464,7 +464,7 @@ fn _weighted_quantile(centroids: &[Centroid], q: f64, weight_power: f64) -> f64 
 
 // Approximate the value at the given quantile (0.0-1.0)
 #[pg_extern(immutable, parallel_safe, name = "approx_percentile")]
-pub fn tdigest_quantile_2<'a>(quantile: f64, digest: TDigest<'a>) -> f64 {
+pub fn tdigest_quantile<'a>(quantile: f64, digest: TDigest<'a>) -> f64 {
     _weighted_quantile(
         digest.to_internal_tdigest().raw_centroids(),
         quantile,
@@ -473,7 +473,7 @@ pub fn tdigest_quantile_2<'a>(quantile: f64, digest: TDigest<'a>) -> f64 {
 }
 
 #[pg_extern(immutable, parallel_safe, name = "approx_percentile")]
-pub fn tdigest_quantile_3<'a>(
+pub fn tdigest_quantile_weighted<'a>(
     quantile: f64,
     digest: TDigest<'a>,
     weight_power: f64,
@@ -491,24 +491,24 @@ pub fn arrow_tdigest_approx_rank<'a>(
     sketch: TDigest<'a>,
     accessor: AccessorApproxPercentileRank,
 ) -> f64 {
-    tdigest_quantile_at_value_2(accessor.value, sketch)
+    tdigest_quantile_at_value(accessor.value, sketch)
 }
 
 // Approximate the quantile at the given value
 #[pg_extern(immutable, parallel_safe, name = "approx_percentile_rank")]
-pub fn tdigest_quantile_at_value_2<'a>(value: f64, digest: TDigest<'a>) -> f64 {
+pub fn tdigest_quantile_at_value<'a>(value: f64, digest: TDigest<'a>) -> f64 {
     let internal = digest.to_internal_tdigest();
     internal.estimate_quantile_at_value(value)
 }
 
 #[pg_extern(immutable, parallel_safe, name = "approx_percentile_rank")]
-pub fn tdigest_quantile_at_value_3<'a>(
+pub fn tdigest_quantile_at_value_weighted<'a>(
     value: f64,
     digest: TDigest<'a>,
     weight_power: f64,
 ) -> f64 {
     if weight_power == 0.0 {
-        return tdigest_quantile_at_value_2(value, digest);
+        return tdigest_quantile_at_value(value, digest);
     }
     let internal = digest.to_internal_tdigest();
     let centroids = internal.raw_centroids();
@@ -526,17 +526,21 @@ pub fn arrow_tdigest_approx_cdf<'a>(
     sketch: TDigest<'a>,
     accessor: AccessorApproxCdf,
 ) -> f64 {
-    tdigest_quantile_at_value_2(accessor.value, sketch)
+    tdigest_quantile_at_value(accessor.value, sketch)
 }
 
 #[pg_extern(immutable, parallel_safe, name = "approx_cdf")]
-pub fn tdigest_approx_cdf_2<'a>(value: f64, digest: TDigest<'a>) -> f64 {
-    tdigest_quantile_at_value_2(value, digest)
+pub fn tdigest_approx_cdf<'a>(value: f64, digest: TDigest<'a>) -> f64 {
+    tdigest_quantile_at_value(value, digest)
 }
 
 #[pg_extern(immutable, parallel_safe, name = "approx_cdf")]
-pub fn tdigest_approx_cdf_3<'a>(value: f64, digest: TDigest<'a>, weight_power: f64) -> f64 {
-    tdigest_quantile_at_value_3(value, digest, weight_power)
+pub fn tdigest_approx_cdf_weighted<'a>(
+    value: f64,
+    digest: TDigest<'a>,
+    weight_power: f64,
+) -> f64 {
+    tdigest_quantile_at_value_weighted(value, digest, weight_power)
 }
 
 pub fn _tdigest_to_histogram_inner<'a>(
@@ -580,12 +584,12 @@ pub fn _tdigest_to_histogram_inner<'a>(
 }
 
 #[pg_extern(immutable, parallel_safe, name = "tdigest_to_histogram")]
-pub fn tdigest_to_histogram_2<'a>(sketch: TDigest<'a>, bin_edges: Vec<f64>) -> Vec<f64> {
+pub fn tdigest_to_histogram<'a>(sketch: TDigest<'a>, bin_edges: Vec<f64>) -> Vec<f64> {
     _tdigest_to_histogram_inner(sketch, bin_edges, 0.0)
 }
 
 #[pg_extern(immutable, parallel_safe, name = "tdigest_to_histogram")]
-pub fn tdigest_to_histogram_3<'a>(
+pub fn tdigest_to_histogram_weighted<'a>(
     sketch: TDigest<'a>,
     bin_edges: Vec<f64>,
     weight_power: f64,
