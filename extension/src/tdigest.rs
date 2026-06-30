@@ -573,6 +573,8 @@ pub fn _tdigest_to_histogram_inner<'a>(
             Err(i) => {
                 if i == 0 {
                     0
+                } else if i >= m {
+                    n_bins - 1
                 } else {
                     i - 1
                 }
@@ -1186,6 +1188,71 @@ mod tests {
 
             client.update("DROP VIEW hist_digest", None, &[]).unwrap();
             client.update("DROP TABLE hist_test", None, &[]).unwrap();
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_histogram_beyond_max_edge() {
+        Spi::connect_mut(|client| {
+            // Regression: centroid mean > max(bin_edges) must not OOB.
+            // Value 150 > edges max 100, binary_search returns Err(5) where len=5.
+            client
+                .update(
+                    "CREATE TABLE beyond_test (data DOUBLE PRECISION)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+            client
+                .update(
+                    "INSERT INTO beyond_test VALUES (50.0), (150.0)",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            client
+                .update(
+                    "CREATE VIEW beyond_digest AS \
+                    SELECT tdigest(100, data) FROM beyond_test",
+                    None,
+                    &[],
+                )
+                .unwrap();
+
+            // edges: [0,25,50,75,100], data: 50 and 150
+            // 50 → exact match edges[2] → bin 2 (Ok path, i=2)
+            // 150 > 100 → Err(5=m) → previously OOB, now clamped to last bin
+            let hist = client
+                .update(
+                    "SELECT tdigest_to_histogram(tdigest, '{0,25,50,75,100}') FROM beyond_digest",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(hist.len(), 4);
+            // bin[2] (50-75): value 50.0 goes here
+            assert!(
+                hist[2] > 0.0,
+                "value=50 at exact edge should be in bin 2"
+            );
+            // bin[3] (75-100): value 150.0 clamped here (beyond max edge)
+            assert!(
+                hist[3] > 0.0,
+                "value=150 beyond max edge should be clamped to last bin"
+            );
+
+            client
+                .update("DROP VIEW beyond_digest", None, &[])
+                .unwrap();
+            client
+                .update("DROP TABLE beyond_test", None, &[])
+                .unwrap();
         });
     }
 
