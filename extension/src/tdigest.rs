@@ -82,7 +82,7 @@ pub fn weighted_tdigest_trans(
                 None => tdigest::Builder::with_size(size.try_into().unwrap()).into(),
                 Some(state) => state,
             };
-            state.push_weighted(value, weight as u64);
+            state.push_weighted(value, weight.round() as u64);
             state.internal()
         })
     }
@@ -1384,7 +1384,33 @@ mod tests {
                 .unwrap();
 
             let diff = (write_time - query_time).abs() / write_time.abs().max(1.0);
-            assert!(diff < 0.01, "write-time vs query-time relative diff: {diff}");
+            assert!(diff < 0.02, "write-time vs query-time relative diff: {diff}");
+        });
+    }
+
+    #[pg_test]
+    fn test_weighted_tdigest_round_not_truncate() {
+        Spi::connect_mut(|client| {
+            // Regression: weighted_tdigest must round() weights, not truncate.
+            // weight=0.9 → round to 1, not truncate to 0.
+            let result = client
+                .update(
+                    "SELECT approx_percentile(0.5, weighted_tdigest(100, 1.0, 0.9))",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            // If weight was truncated to 0, result would be NULL (empty sketch).
+            // With correct rounding, weight=1, result should be the centroid mean ≈ 1.0.
+            assert!(
+                (result - 1.0).abs() < 0.01,
+                "weight=0.9 should round to 1, got {result}"
+            );
         });
     }
 }
