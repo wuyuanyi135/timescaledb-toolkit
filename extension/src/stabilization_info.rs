@@ -17,7 +17,11 @@ crate::functions_stabilized_at! {
         arrow_tdigest_approx_cdf(tdigest,accessorapproxcdf),
         tdigest_approx_cdf(double precision,tdigest),
         approx_cdf(double precision),
-
+        weighted_tdigest_trans(internal,integer,double precision,double precision),
+        approx_percentile(double precision,tdigest,double precision),
+        approx_percentile_rank(double precision,tdigest,double precision),
+        approx_cdf(double precision,tdigest,double precision),
+        tdigest_to_histogram(tdigest,anyarray,double precision),
     }
     "1.23.0" => {
         stats_agg(bigint),

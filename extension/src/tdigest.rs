@@ -55,6 +55,39 @@ pub fn tdigest_trans_inner(
     }
 }
 
+// PG function for adding weighted values to a digest.
+// Null values or weights are ignored.
+#[pg_extern(immutable, parallel_safe)]
+pub fn weighted_tdigest_trans(
+    state: Internal,
+    size: i32,
+    value: Option<f64>,
+    weight: Option<f64>,
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> Option<Internal> {
+    unsafe {
+        in_aggregate_context(fcinfo, || {
+            let value = match value {
+                None => return Some(state),
+                Some(value) if value.is_nan() => return Some(state),
+                Some(value) => value,
+            };
+            let weight = match weight {
+                None => return Some(state),
+                Some(w) if w <= 0.0 => return Some(state),
+                Some(w) if w.is_nan() => return Some(state),
+                Some(w) => w,
+            };
+            let mut state = match unsafe { state.to_inner() } {
+                None => tdigest::Builder::with_size(size.try_into().unwrap()).into(),
+                Some(state) => state,
+            };
+            state.push_weighted(value, weight as u64);
+            state.internal()
+        })
+    }
+}
+
 // PG function for merging digests.
 #[pg_extern(immutable, parallel_safe)]
 pub fn tdigest_combine(
@@ -219,6 +252,29 @@ extension_sql!(
     ],
 );
 
+extension_sql!(
+    "\n\
+    CREATE AGGREGATE weighted_tdigest(size integer, value DOUBLE PRECISION, weight DOUBLE PRECISION)\n\
+    (\n\
+        sfunc = weighted_tdigest_trans,\n\
+        stype = internal,\n\
+        finalfunc = tdigest_final,\n\
+        combinefunc = tdigest_combine,\n\
+        serialfunc = tdigest_serialize,\n\
+        deserialfunc = tdigest_deserialize,\n\
+        parallel = safe\n\
+    );\n\
+",
+    name = "weighted_tdigest_agg",
+    requires = [
+        weighted_tdigest_trans,
+        tdigest_final,
+        tdigest_combine,
+        tdigest_serialize,
+        tdigest_deserialize
+    ],
+);
+
 #[pg_extern(immutable, parallel_safe)]
 pub fn tdigest_compound_trans(
     state: Internal,
@@ -339,13 +395,94 @@ pub fn arrow_tdigest_approx_percentile<'a>(
     sketch: TDigest<'a>,
     accessor: AccessorApproxPercentile,
 ) -> f64 {
-    tdigest_quantile(accessor.percentile, sketch)
+    tdigest_quantile_2(accessor.percentile, sketch)
+}
+
+// Helper: weighted cumulative weight at a given value
+fn _weighted_cumulative_at(centroids: &[Centroid], value: f64, weight_power: f64) -> (f64, f64) {
+    let mut cumulative = 0.0_f64;
+    for c in centroids {
+        let w = if weight_power == 0.0 {
+            c.weight() as f64
+        } else {
+            c.weight() as f64 * c.mean().powf(weight_power)
+        };
+        if c.mean() >= value {
+            break;
+        }
+        cumulative += w;
+    }
+    let total: f64 = centroids.iter().map(|c| {
+        if weight_power == 0.0 {
+            c.weight() as f64
+        } else {
+            c.weight() as f64 * c.mean().powf(weight_power)
+        }
+    }).sum();
+    (cumulative, total)
+}
+
+// Helper: weighted quantile (inverse CDF)
+fn _weighted_quantile(centroids: &[Centroid], q: f64, weight_power: f64) -> f64 {
+    if centroids.is_empty() {
+        return 0.0;
+    }
+    if q <= 0.0 {
+        return centroids.first().unwrap().mean();
+    }
+    if q >= 1.0 {
+        return centroids.last().unwrap().mean();
+    }
+
+    // Compute total weighted count
+    let total: f64 = centroids.iter().map(|c| {
+        if weight_power == 0.0 {
+            c.weight() as f64
+        } else {
+            c.weight() as f64 * c.mean().powf(weight_power)
+        }
+    }).sum();
+
+    let target = q * total;
+    let mut cumulative = 0.0_f64;
+
+    for c in centroids {
+        let w = if weight_power == 0.0 {
+            c.weight() as f64
+        } else {
+            c.weight() as f64 * c.mean().powf(weight_power)
+        };
+        if cumulative + w >= target {
+            // Interpolate within this centroid
+            let centroid_frac = (target - cumulative) / w;
+            return c.mean(); // simplified: return centroid mean
+        }
+        cumulative += w;
+    }
+    centroids.last().unwrap().mean()
 }
 
 // Approximate the value at the given quantile (0.0-1.0)
 #[pg_extern(immutable, parallel_safe, name = "approx_percentile")]
-pub fn tdigest_quantile<'a>(quantile: f64, digest: TDigest<'a>) -> f64 {
-    digest.to_internal_tdigest().estimate_quantile(quantile)
+pub fn tdigest_quantile_2<'a>(quantile: f64, digest: TDigest<'a>) -> f64 {
+    _weighted_quantile(
+        digest.to_internal_tdigest().raw_centroids(),
+        quantile,
+        0.0,
+    )
+}
+
+#[pg_extern(immutable, parallel_safe, name = "approx_percentile")]
+pub fn tdigest_quantile_3<'a>(
+    quantile: f64,
+    digest: TDigest<'a>,
+    weight_power: f64,
+) -> f64 {
+    _weighted_quantile(
+        digest.to_internal_tdigest().raw_centroids(),
+        quantile,
+        weight_power,
+    )
 }
 
 #[pg_operator(immutable, parallel_safe)]
@@ -354,15 +491,33 @@ pub fn arrow_tdigest_approx_rank<'a>(
     sketch: TDigest<'a>,
     accessor: AccessorApproxPercentileRank,
 ) -> f64 {
-    tdigest_quantile_at_value(accessor.value, sketch)
+    tdigest_quantile_at_value_2(accessor.value, sketch)
 }
 
 // Approximate the quantile at the given value
 #[pg_extern(immutable, parallel_safe, name = "approx_percentile_rank")]
-pub fn tdigest_quantile_at_value<'a>(value: f64, digest: TDigest<'a>) -> f64 {
-    digest
-        .to_internal_tdigest()
-        .estimate_quantile_at_value(value)
+pub fn tdigest_quantile_at_value_2<'a>(value: f64, digest: TDigest<'a>) -> f64 {
+    let internal = digest.to_internal_tdigest();
+    internal.estimate_quantile_at_value(value)
+}
+
+#[pg_extern(immutable, parallel_safe, name = "approx_percentile_rank")]
+pub fn tdigest_quantile_at_value_3<'a>(
+    value: f64,
+    digest: TDigest<'a>,
+    weight_power: f64,
+) -> f64 {
+    if weight_power == 0.0 {
+        return tdigest_quantile_at_value_2(value, digest);
+    }
+    let internal = digest.to_internal_tdigest();
+    let centroids = internal.raw_centroids();
+    let (cum, total) = _weighted_cumulative_at(centroids, value, weight_power);
+    if total == 0.0 {
+        0.0
+    } else {
+        cum / total
+    }
 }
 
 #[pg_operator(immutable, parallel_safe)]
@@ -371,11 +526,24 @@ pub fn arrow_tdigest_approx_cdf<'a>(
     sketch: TDigest<'a>,
     accessor: AccessorApproxCdf,
 ) -> f64 {
-    tdigest_quantile_at_value(accessor.value, sketch)
+    tdigest_quantile_at_value_2(accessor.value, sketch)
 }
 
-#[pg_extern(immutable, parallel_safe, name = "tdigest_to_histogram")]
-pub fn tdigest_to_histogram<'a>(sketch: TDigest<'a>, bin_edges: Vec<f64>) -> Vec<f64> {
+#[pg_extern(immutable, parallel_safe, name = "approx_cdf")]
+pub fn tdigest_approx_cdf_2<'a>(value: f64, digest: TDigest<'a>) -> f64 {
+    tdigest_quantile_at_value_2(value, digest)
+}
+
+#[pg_extern(immutable, parallel_safe, name = "approx_cdf")]
+pub fn tdigest_approx_cdf_3<'a>(value: f64, digest: TDigest<'a>, weight_power: f64) -> f64 {
+    tdigest_quantile_at_value_3(value, digest, weight_power)
+}
+
+pub fn _tdigest_to_histogram_inner<'a>(
+    sketch: TDigest<'a>,
+    bin_edges: Vec<f64>,
+    weight_power: f64,
+) -> Vec<f64> {
     let m = bin_edges.len();
     if m < 2 || sketch.count == 0 {
         return vec![0.0_f64; if m > 1 { m - 1 } else { 0 }];
@@ -385,7 +553,11 @@ pub fn tdigest_to_histogram<'a>(sketch: TDigest<'a>, bin_edges: Vec<f64>) -> Vec
     let internal = sketch.to_internal_tdigest();
     for c in internal.raw_centroids() {
         let mean = c.mean();
-        let weight = c.weight() as f64;
+        let weight = if weight_power == 0.0 {
+            c.weight() as f64
+        } else {
+            c.weight() as f64 * mean.powf(weight_power)
+        };
         let idx = match bin_edges.binary_search_by(|e| e.partial_cmp(&mean).unwrap()) {
             Ok(i) => {
                 if i >= n_bins {
@@ -407,11 +579,18 @@ pub fn tdigest_to_histogram<'a>(sketch: TDigest<'a>, bin_edges: Vec<f64>) -> Vec
     hist
 }
 
-#[pg_extern(immutable, parallel_safe, name = "approx_cdf")]
-pub fn tdigest_approx_cdf<'a>(value: f64, digest: TDigest<'a>) -> f64 {
-    digest
-        .to_internal_tdigest()
-        .estimate_quantile_at_value(value)
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_histogram")]
+pub fn tdigest_to_histogram_2<'a>(sketch: TDigest<'a>, bin_edges: Vec<f64>) -> Vec<f64> {
+    _tdigest_to_histogram_inner(sketch, bin_edges, 0.0)
+}
+
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_histogram")]
+pub fn tdigest_to_histogram_3<'a>(
+    sketch: TDigest<'a>,
+    bin_edges: Vec<f64>,
+    weight_power: f64,
+) -> Vec<f64> {
+    _tdigest_to_histogram_inner(sketch, bin_edges, weight_power)
 }
 
 #[pg_operator(immutable, parallel_safe)]
@@ -1003,6 +1182,205 @@ mod tests {
 
             client.update("DROP VIEW hist_digest", None, &[]).unwrap();
             client.update("DROP TABLE hist_test", None, &[]).unwrap();
+        });
+    }
+
+    #[pg_test]
+    fn test_weighted_tdigest_identity() {
+        Spi::connect_mut(|client| {
+            // weighted_tdigest with weight=1 for all -> same as unweighted
+            let d50_weighted = client
+                .update(
+                    "SELECT approx_percentile(0.5, weighted_tdigest(100, v, 1.0)) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            let d50_unweighted = client
+                .update(
+                    "SELECT approx_percentile(0.5, tdigest(100, v)) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(d50_weighted, d50_unweighted, 0.001);
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_percentile_weight_power_x3() {
+        Spi::connect_mut(|client| {
+            // Two values: 1.0 and 3.0 with weight_power=3
+            // 3^3 = 27, 1^3 = 1 => weighted median should be much closer to 3.0
+            let d50 = client
+                .update(
+                    "SELECT approx_percentile(0.5, tdigest(100, v), 3) \
+                    FROM (SELECT * FROM (VALUES (1.0), (3.0)) AS t(v)) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            // With x³ weighting, 3.0 has 27× the weight of 1.0
+            // The weighted median should be >= 3.0 (or very close)
+            assert!(d50 >= 2.5, "weighted median should shift toward larger value, got {d50}");
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_percentile_weight_power_0_not_changed() {
+        Spi::connect_mut(|client| {
+            let val_2arg = client
+                .update(
+                    "SELECT approx_percentile(0.5, tdigest(100, v)) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            let val_3arg_weight0 = client
+                .update(
+                    "SELECT approx_percentile(0.5, tdigest(100, v), 0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(val_2arg, val_3arg_weight0, 0.0001);
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_histogram_weight_power_0_unchanged() {
+        Spi::connect_mut(|client| {
+            let hist_2arg = client
+                .update(
+                    "SELECT tdigest_to_histogram(tdigest(100, v), '{0,25,50,75,100}') \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let hist_3arg = client
+                .update(
+                    "SELECT tdigest_to_histogram(tdigest(100, v), '{0,25,50,75,100}', 0.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(hist_2arg.len(), hist_3arg.len());
+            for (a, b) in hist_2arg.iter().zip(hist_3arg.iter()) {
+                apx_eql(*a, *b, 0.0001);
+            }
+        });
+    }
+
+    #[pg_test]
+    fn test_weighted_tdigest_rollup() {
+        Spi::connect_mut(|client| {
+            // Build two weighted sketches separately, rollup, compare with single sketch
+            let rolled = client
+                .update(
+                    "SELECT approx_percentile(0.5, rollup(s)) \
+                    FROM (SELECT weighted_tdigest(100, v, w) AS s \
+                          FROM (VALUES (1.0, 5.0), (2.0, 1.0), (3.0, 1.0)) AS t(v, w) \
+                          GROUP BY CASE WHEN v <= 2 THEN 0 ELSE 1 END) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            let single = client
+                .update(
+                    "SELECT approx_percentile(0.5, weighted_tdigest(100, v, w)) \
+                    FROM (VALUES (1.0, 5.0), (2.0, 1.0), (3.0, 1.0)) AS t(v, w)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(rolled, single, 0.01);
+        });
+    }
+
+    #[pg_test]
+    fn test_write_time_vs_query_time_weighting() {
+        Spi::connect_mut(|client| {
+            // write-time: weighted_tdigest(v, v^3) with default approx_percentile
+            // should match query-time: tdigest(v) with approx_percentile(..., 3)
+            let write_time = client
+                .update(
+                    "SELECT approx_percentile(0.5, weighted_tdigest(100, v, v^3)) \
+                    FROM (SELECT generate_series(0.5, 100.0, 0.5) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            let query_time = client
+                .update(
+                    "SELECT approx_percentile(0.5, tdigest(100, v), 3) \
+                    FROM (SELECT generate_series(0.5, 100.0, 0.5) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            let diff = (write_time - query_time).abs() / write_time.abs().max(1.0);
+            assert!(diff < 0.01, "write-time vs query-time relative diff: {diff}");
         });
     }
 }

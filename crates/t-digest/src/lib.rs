@@ -260,6 +260,116 @@ impl TDigest {
         }
     }
 
+    pub fn merge_weighted_unsorted(&self, weighted_values: Vec<(f64, u64)>) -> TDigest {
+        let mut sorted: Vec<(OrderedFloat<f64>, u64)> = weighted_values
+            .into_iter()
+            .map(|(v, w)| (OrderedFloat::from(v), w))
+            .collect();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let sorted_values: Vec<(f64, u64)> = sorted
+            .into_iter()
+            .map(|(v, w)| (v.into_inner(), w))
+            .collect();
+        self.merge_sorted_weighted(sorted_values)
+    }
+
+    fn merge_sorted_weighted(&self, sorted_values: Vec<(f64, u64)>) -> TDigest {
+        if sorted_values.is_empty() {
+            return self.clone();
+        }
+
+        let mut result = TDigest::new_with_size(self.max_size());
+        result.count = self.count();
+        for &(_v, w) in &sorted_values {
+            result.count += w;
+        }
+
+        let maybe_min = OrderedFloat::from(sorted_values.first().unwrap().0);
+        let maybe_max = OrderedFloat::from(sorted_values.last().unwrap().0);
+
+        if self.count() > 0 {
+            result.min = std::cmp::min(self.min, maybe_min);
+            result.max = std::cmp::max(self.max, maybe_max);
+        } else {
+            result.min = maybe_min;
+            result.max = maybe_max;
+        }
+
+        let mut compressed: Vec<Centroid> = Vec::with_capacity(self.max_size);
+
+        let mut k_limit: f64 = 1.0;
+        let mut q_limit_times_count: f64 =
+            Self::k_to_q(k_limit, self.max_size as f64) * result.count as f64;
+        k_limit += 1.0;
+
+        let mut iter_centroids = self.centroids.iter().peekable();
+        let mut iter_weighted = sorted_values.iter().peekable();
+
+        let mut curr: Centroid = if let Some(c) = iter_centroids.peek() {
+            let curr = iter_weighted.peek().unwrap().0;
+            if c.mean() < curr {
+                iter_centroids.next().unwrap().clone()
+            } else {
+                let (v, w) = *iter_weighted.next().unwrap();
+                Centroid::new(v, w)
+            }
+        } else {
+            let (v, w) = *iter_weighted.next().unwrap();
+            Centroid::new(v, w)
+        };
+
+        let mut weight_so_far: u64 = curr.weight();
+
+        let mut sums_to_merge: f64 = 0.0;
+        let mut weights_to_merge: u64 = 0;
+
+        while iter_centroids.peek().is_some() || iter_weighted.peek().is_some() {
+            let next: Centroid = if let Some(c) = iter_centroids.peek() {
+                if iter_weighted.peek().is_none()
+                    || c.mean() < iter_weighted.peek().unwrap().0
+                {
+                    iter_centroids.next().unwrap().clone()
+                } else {
+                    let (v, w) = *iter_weighted.next().unwrap();
+                    Centroid::new(v, w)
+                }
+            } else {
+                let (v, w) = *iter_weighted.next().unwrap();
+                Centroid::new(v, w)
+            };
+
+            let mut next_weight = next.weight();
+            if weight_so_far + next_weight <= q_limit_times_count as u64 {
+                sums_to_merge += next.mean() * next_weight as f64;
+                weights_to_merge += next_weight;
+                weight_so_far += next_weight;
+            } else {
+                if weights_to_merge > 0 {
+                    let mean = sums_to_merge / weights_to_merge as f64;
+                    compressed.push(Centroid::new(mean, weights_to_merge));
+                }
+                let actual = self.centroids.len() + sorted_values.len();
+                let centroid_count = compressed.len() + 1;
+                if centroid_count as f64 / actual as f64 > 0.5 {
+                    k_limit += 1.0;
+                    q_limit_times_count =
+                        Self::k_to_q(k_limit, self.max_size as f64) * result.count as f64;
+                }
+                sums_to_merge = next.mean() * next_weight as f64;
+                weights_to_merge = next_weight;
+                weight_so_far += next_weight;
+            }
+        }
+
+        if weights_to_merge > 0 {
+            let mean = sums_to_merge / weights_to_merge as f64;
+            compressed.push(Centroid::new(mean, weights_to_merge));
+        }
+
+        result.centroids = compressed;
+        result
+    }
+
     pub fn merge_unsorted(&self, unsorted_values: Vec<f64>) -> TDigest {
         let mut sorted_values: Vec<OrderedFloat<f64>> = unsorted_values
             .into_iter()
@@ -684,6 +794,8 @@ impl TDigest {
 pub struct Builder {
     #[serde(skip)]
     buffer: Vec<f64>,
+    #[serde(skip)]
+    weighted_buffer: Vec<(f64, u64)>,
     digested: TDigest,
 }
 
@@ -710,7 +822,20 @@ impl Builder {
         }
     }
 
-    // Update the digest with all accumulated values.
+    // Add a weighted value, recalculate the digest if we've crossed a threshold.
+    // The weight is the number of times this value should be counted.
+    pub fn push_weighted(&mut self, value: f64, weight: u64) {
+        // For weight=1, use the more efficient unweighted path
+        if weight == 1 {
+            return self.push(value);
+        }
+        self.weighted_buffer.push((value, weight));
+        if self.weighted_buffer.len() >= self.digested.max_size() {
+            self.digest_weighted()
+        }
+    }
+
+    // Update the digest with all accumulated unweighted values.
     fn digest(&mut self) {
         if self.buffer.is_empty() {
             return;
@@ -719,19 +844,39 @@ impl Builder {
         self.digested = self.digested.merge_unsorted(new)
     }
 
-    pub fn build(&mut self) -> TDigest {
+    // Flush all pending values (both weighted and unweighted) into the digest.
+    fn flush_all(&mut self) {
         self.digest();
+        self.digest_weighted();
+    }
+
+    fn digest_weighted(&mut self) {
+        if self.weighted_buffer.is_empty() {
+            return;
+        }
+        let new = std::mem::take(&mut self.weighted_buffer);
+        self.digested = self.digested.merge_weighted_unsorted(new)
+    }
+
+    pub fn build(&mut self) -> TDigest {
+        self.flush_all();
         std::mem::take(&mut self.digested)
     }
 
     pub fn merge(&mut self, other: Self) {
         assert_eq!(self.digested.max_size(), other.digested.max_size());
-        let digvec = vec![std::mem::take(&mut self.digested), other.digested];
+        let mut digvec = vec![std::mem::take(&mut self.digested), other.digested];
         if !self.buffer.is_empty() {
-            digvec[0].merge_unsorted(std::mem::take(&mut self.buffer));
+            digvec[0] = digvec[0].merge_unsorted(std::mem::take(&mut self.buffer));
+        }
+        if !self.weighted_buffer.is_empty() {
+            digvec[0] = digvec[0].merge_weighted_unsorted(std::mem::take(&mut self.weighted_buffer));
         }
         if !other.buffer.is_empty() {
-            digvec[1].merge_unsorted(other.buffer);
+            digvec[1] = digvec[1].merge_unsorted(other.buffer);
+        }
+        if !other.weighted_buffer.is_empty() {
+            digvec[1] = digvec[1].merge_weighted_unsorted(other.weighted_buffer);
         }
         self.digested = TDigest::merge_digests(digvec);
     }
