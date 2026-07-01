@@ -599,6 +599,76 @@ pub fn tdigest_to_histogram_weighted<'a>(
     _tdigest_to_histogram_inner(sketch, bin_edges, weight_power)
 }
 
+// tdigest_to_pdf: returns num_points PDF samples as percentage values
+// y[i] = (CDF(x_hi) - CDF(x_lo)) * 100.0
+pub fn _tdigest_to_pdf_inner<'a>(
+    sketch: TDigest<'a>,
+    num_points: i32,
+    x_min: f64,
+    x_max: f64,
+    weight_power: f64,
+) -> Vec<f64> {
+    if num_points <= 0 {
+        return vec![];
+    }
+    if sketch.count == 0 {
+        return vec![0.0_f64; num_points as usize];
+    }
+    let n = num_points as usize;
+    let dx = (x_max - x_min) / n as f64;
+    let mut result = vec![0.0_f64; n];
+
+    let internal = sketch.to_internal_tdigest();
+    let centroids = internal.raw_centroids();
+
+    if weight_power == 0.0 {
+        // Unweighted path: use estimate_quantile_at_value on the internal digest
+        for i in 0..n {
+            let x_lo = x_min + i as f64 * dx;
+            let x_hi = x_min + (i + 1) as f64 * dx;
+            let cdf_lo = internal.estimate_quantile_at_value(x_lo);
+            let cdf_hi = internal.estimate_quantile_at_value(x_hi);
+            result[i] = (cdf_hi - cdf_lo) * 100.0;
+        }
+    } else {
+        // Weighted path: use _weighted_cumulative_at
+        for i in 0..n {
+            let x_lo = x_min + i as f64 * dx;
+            let x_hi = x_min + (i + 1) as f64 * dx;
+            let (cum_lo, total) = _weighted_cumulative_at(centroids, x_lo, weight_power);
+            let (cum_hi, _) = _weighted_cumulative_at(centroids, x_hi, weight_power);
+            if total == 0.0 {
+                result[i] = 0.0;
+            } else {
+                result[i] = ((cum_hi - cum_lo) / total) * 100.0;
+            }
+        }
+    }
+
+    result
+}
+
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_pdf")]
+pub fn tdigest_to_pdf<'a>(
+    sketch: TDigest<'a>,
+    num_points: i32,
+    x_min: f64,
+    x_max: f64,
+) -> Vec<f64> {
+    _tdigest_to_pdf_inner(sketch, num_points, x_min, x_max, 0.0)
+}
+
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_pdf")]
+pub fn tdigest_to_pdf_weighted<'a>(
+    sketch: TDigest<'a>,
+    num_points: i32,
+    x_min: f64,
+    x_max: f64,
+    weight_power: f64,
+) -> Vec<f64> {
+    _tdigest_to_pdf_inner(sketch, num_points, x_min, x_max, weight_power)
+}
+
 #[pg_operator(immutable, parallel_safe)]
 #[opname(->)]
 pub fn arrow_tdigest_num_vals<'a>(sketch: TDigest<'a>, _accessor: AccessorNumVals) -> f64 {
@@ -1477,6 +1547,349 @@ mod tests {
             assert!(
                 (result - 1.0).abs() < 0.01,
                 "weight=0.9 should round to 1, got {result}"
+            );
+        });
+    }
+
+    // ─── tdigest_to_pdf tests ───────────────────────────────────────
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_basic() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 100, 0.0, 100.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(pdf.len(), 100);
+            let sum: f64 = pdf.iter().sum();
+            apx_eql(sum, 100.0, 0.5);
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_empty() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 100, 0.0, 100.0) \
+                    FROM (SELECT NULL::double precision AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap();
+
+            if let Some(ref arr) = pdf {
+                assert_eq!(arr.len(), 100);
+                for &v in arr.iter() {
+                    assert!((v - 0.0).abs() < 1e-10);
+                }
+            }
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_single_centroid() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, 50.0), 100, 0.0, 100.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(pdf.len(), 100);
+            let sum: f64 = pdf.iter().sum();
+            apx_eql(sum, 100.0, 0.5);
+            let nonzero = pdf.iter().filter(|&&v| v > 0.0).count();
+            assert!(nonzero > 0, "single centroid should produce at least one nonzero bin");
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_weight_power_0() {
+        Spi::connect_mut(|client| {
+            let pdf_4arg = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 50, 0.0, 100.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let pdf_5arg = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 50, 0.0, 100.0, 0.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(pdf_4arg.len(), pdf_5arg.len());
+            for (a, b) in pdf_4arg.iter().zip(pdf_5arg.iter()) {
+                apx_eql(*a, *b, 0.0001);
+            }
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_sum_equals_100() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 200, 0.0, 100.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let sum: f64 = pdf.iter().sum();
+            assert!(
+                (sum - 100.0).abs() < 0.1,
+                "sum(pdf) = {sum}, expected 100.0 ± 0.1"
+            );
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_weighted() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 100, 0.0, 100.0, 3.0) \
+                    FROM (SELECT generate_series(1.0, 99.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(pdf.len(), 100);
+            let sum: f64 = pdf.iter().sum();
+            apx_eql(sum, 100.0, 0.5);
+            let nonzero = pdf.iter().filter(|&&v| v > 0.0).count();
+            assert!(nonzero > 0, "weighted pdf should produce nonzero bins");
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_zero_bins_fewer_than_histogram() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 200, 0.0, 100.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let hist = client
+                .update(
+                    "SELECT tdigest_to_histogram(tdigest(100, v), '{0,25,50,75,100}') \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let pdf_zeros = pdf.iter().filter(|&&v| v == 0.0).count();
+            let hist_zeros = hist.iter().filter(|&&v| v == 0.0).count();
+
+            let pdf_density = (pdf.len() - pdf_zeros) as f64 / pdf.len() as f64;
+            let hist_density = (hist.len() - hist_zeros) as f64 / hist.len() as f64;
+            assert!(
+                pdf_density > hist_density,
+                "pdf fill ratio {pdf_density} should exceed histogram fill ratio {hist_density}"
+            );
+        });
+    }
+
+    // ─── weighted approx_cdf tests ──────────────────────────────────
+
+    #[pg_test]
+    fn test_approx_cdf_weight_power_0() {
+        Spi::connect_mut(|client| {
+            let cdf_2arg = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, v), 50.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            let cdf_3arg = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, v), 50.0, 0.0) \
+                    FROM (SELECT generate_series(0.01, 99.99, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(cdf_2arg, cdf_3arg, 0.0001);
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_cdf_weighted_basic() {
+        Spi::connect_mut(|client| {
+            let cdf = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, v), 50.0, 3.0) \
+                    FROM (SELECT generate_series(1.0, 99.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            assert!(cdf > 0.0 && cdf < 1.0, "weighted cdf should be in (0,1), got {cdf}");
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_cdf_percentile_consistency() {
+        Spi::connect_mut(|client| {
+            let cdf_at_d50 = client
+                .update(
+                    "SELECT approx_cdf(
+                        approx_percentile(0.5, tdigest(100, v), 3.0),
+                        tdigest(100, v),
+                        3.0
+                    ) \
+                    FROM (SELECT generate_series(1.0, 99.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(cdf_at_d50, 0.5, 0.01);
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_cdf_percentile_consistency_multiple_quantiles() {
+        Spi::connect_mut(|client| {
+            let cdf_at_d10 = client
+                .update(
+                    "SELECT approx_cdf(
+                        approx_percentile(0.1, tdigest(100, v), 3.0),
+                        tdigest(100, v),
+                        3.0
+                    ) \
+                    FROM (SELECT generate_series(1.0, 99.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            let cdf_at_d90 = client
+                .update(
+                    "SELECT approx_cdf(
+                        approx_percentile(0.9, tdigest(100, v), 3.0),
+                        tdigest(100, v),
+                        3.0
+                    ) \
+                    FROM (SELECT generate_series(1.0, 99.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+
+            apx_eql(cdf_at_d10, 0.1, 0.01);
+            apx_eql(cdf_at_d90, 0.9, 0.01);
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_weighted_consistency_with_histogram() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 100, 0.0, 100.0, 3.0) \
+                    FROM (SELECT generate_series(1.0, 99.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let sum: f64 = pdf.iter().sum();
+            apx_eql(sum, 100.0, 0.5);
+            let nonzero = pdf.iter().filter(|&&v| v > 0.0).count();
+            assert!(
+                nonzero > 50,
+                "weighted pdf should have >50 nonzero bins, got {nonzero}"
             );
         });
     }
