@@ -655,6 +655,10 @@ impl TDigest {
             accum_weight += low_weight;
         }
 
+        if hi_bound == low_bound {
+            return accum_weight as f64 / self.count as f64;
+        }
+
         let weighted_midpoint = low_bound
             + (hi_bound - low_bound) * low_weight as f64 / (low_weight + hi_weight) as f64;
         if v > weighted_midpoint {
@@ -1135,6 +1139,64 @@ mod tests {
         }
         let estimate = digested.estimate_quantile(0.99);
         assert_eq!(estimate, 99.5);
+    }
+
+    #[test]
+    fn test_estimate_quantile_at_value_all_equal() {
+        let vals = vec![200.0; 100];
+        let t = TDigest::new_with_size(10).merge_unsorted(vals);
+
+        let cdf_at_mean = t.estimate_quantile_at_value(200.0);
+        assert!(!cdf_at_mean.is_nan(), "CDF at centroid mean should not be NaN");
+        assert!((cdf_at_mean - 1.0).abs() < 1e-10, "CDF at centroid mean should be 1.0, got {cdf_at_mean}");
+
+        let cdf_below = t.estimate_quantile_at_value(0.0);
+        assert!((cdf_below - 0.0).abs() < 1e-10, "CDF below min should be 0.0, got {cdf_below}");
+
+        let cdf_above = t.estimate_quantile_at_value(999.0);
+        assert!((cdf_above - 1.0).abs() < 1e-10, "CDF above max should be 1.0, got {cdf_above}");
+
+        // Also directly trigger the NaN path: adjacent equal centroids
+        let centroids = vec![Centroid::new(200.0, 50), Centroid::new(200.0, 50)];
+        let t2 = TDigest::new(centroids, 20000.0, 100, 200.0, 200.0, 10);
+        let cdf = t2.estimate_quantile_at_value(200.0);
+        assert!(!cdf.is_nan(), "equal-mean centroids should not produce NaN");
+    }
+
+    #[test]
+    fn test_estimate_quantile_at_value_empty() {
+        let t = TDigest::new_with_size(10);
+        let cdf = t.estimate_quantile_at_value(42.0);
+        assert!((cdf - 0.0).abs() < 1e-10, "empty sketch CDF should be 0, got {cdf}");
+    }
+
+    #[test]
+    fn test_estimate_quantile_at_value_single_value() {
+        let t = TDigest::new_with_size(10).merge_unsorted(vec![42.0]);
+        let cdf_below = t.estimate_quantile_at_value(41.9);
+        assert!((cdf_below - 0.0).abs() < 1e-10, "CDF below single value should be 0.0");
+        let cdf_at = t.estimate_quantile_at_value(42.0);
+        assert!(!cdf_at.is_nan(), "CDF at single value should not be NaN");
+        assert!((cdf_at - 1.0).abs() < 1e-10, "CDF at single value should be 1.0, got {cdf_at}");
+        let cdf_above = t.estimate_quantile_at_value(42.1);
+        assert!((cdf_above - 1.0).abs() < 1e-10, "CDF above single value should be 1.0");
+    }
+
+    #[test]
+    fn test_estimate_quantile_at_value_constant_distribution() {
+        let vals = vec![100.0; 50];
+        let t = TDigest::new_with_size(10).merge_unsorted(vals);
+        // For a constant distribution, every quantile returns the same value.
+        // CDF at that value should be 1.0 (all data ≤ the value).
+        for q in [0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99] {
+            let v = t.estimate_quantile(q);
+            let cdf = t.estimate_quantile_at_value(v);
+            assert!(!cdf.is_nan(), "CDF(quantile({q})) should not be NaN, got NaN");
+            assert!(
+                (cdf - 1.0).abs() < 1e-10,
+                "CDF(quantile({q})) = {cdf}, expected 1.0 (constant distribution)"
+            );
+        }
     }
 
     use quickcheck::*;

@@ -669,6 +669,118 @@ pub fn tdigest_to_pdf_weighted<'a>(
     _tdigest_to_pdf_inner(sketch, num_points, x_min, x_max, weight_power)
 }
 
+// Gaussian kernel density estimation
+
+fn gaussian_pdf(x: f64) -> f64 {
+    (-x * x / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+fn _tdigest_to_pdf_kde_inner<'a>(
+    sketch: TDigest<'a>,
+    num_points: i32,
+    x_min: f64,
+    x_max: f64,
+    bandwidth: f64,
+    weight_power: f64,
+) -> Vec<f64> {
+    if num_points <= 0 {
+        return vec![];
+    }
+    if sketch.count == 0 {
+        return vec![0.0_f64; num_points as usize];
+    }
+
+    let n = num_points as usize;
+    let dx = (x_max - x_min) / n as f64;
+    let mut result = vec![0.0_f64; n];
+
+    let internal = sketch.to_internal_tdigest();
+    let centroids = internal.raw_centroids();
+
+    let weighted: Vec<(f64, f64)> = centroids
+        .iter()
+        .map(|c| {
+            let w = if weight_power == 0.0 {
+                c.weight() as f64
+            } else {
+                c.weight() as f64 * c.mean().powf(weight_power)
+            };
+            (c.mean(), w)
+        })
+        .collect();
+
+    let total_weight: f64 = weighted.iter().map(|&(_, w)| w).sum();
+
+    if total_weight == 0.0 {
+        return vec![0.0_f64; n];
+    }
+
+    // Auto-estimate bandwidth via Silverman's rule of thumb
+    let bw = if bandwidth <= 0.0 {
+        let weighted_mean: f64 = weighted.iter().map(|&(m, w)| m * w).sum::<f64>() / total_weight;
+        let variance: f64 = weighted
+            .iter()
+            .map(|&(m, w)| w * (m - weighted_mean).powi(2))
+            .sum::<f64>()
+            / total_weight;
+        let std = variance.sqrt();
+        let sum_w2: f64 = weighted.iter().map(|&(_, w)| w * w).sum();
+        let n_eff = total_weight * total_weight / sum_w2;
+        let rule = 1.06 * std * n_eff.powf(-0.2);
+        if rule <= 0.0 || !rule.is_finite() {
+            dx / 2.0
+        } else {
+            rule
+        }
+    } else {
+        bandwidth
+    };
+
+    for i in 0..n {
+        let x = x_min + (i as f64 + 0.5) * dx;
+        let mut sum = 0.0;
+        for &(m, w) in &weighted {
+            sum += w * gaussian_pdf((x - m) / bw);
+        }
+        result[i] = sum / (total_weight * bw) * dx * 100.0;
+    }
+
+    result
+}
+
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_pdf_kde")]
+pub fn tdigest_to_pdf_kde<'a>(
+    sketch: TDigest<'a>,
+    num_points: i32,
+    x_min: f64,
+    x_max: f64,
+) -> Vec<f64> {
+    _tdigest_to_pdf_kde_inner(sketch, num_points, x_min, x_max, 0.0, 0.0)
+}
+
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_pdf_kde")]
+pub fn tdigest_to_pdf_kde_bandwidth<'a>(
+    sketch: TDigest<'a>,
+    num_points: i32,
+    x_min: f64,
+    x_max: f64,
+    bandwidth: f64,
+) -> Vec<f64> {
+    _tdigest_to_pdf_kde_inner(sketch, num_points, x_min, x_max, bandwidth, 0.0)
+}
+
+#[pg_extern(immutable, parallel_safe, name = "tdigest_to_pdf_kde")]
+pub fn tdigest_to_pdf_kde_weighted<'a>(
+    sketch: TDigest<'a>,
+    num_points: i32,
+    x_min: f64,
+    x_max: f64,
+    bandwidth: f64,
+    weight_power: f64,
+) -> Vec<f64> {
+    _tdigest_to_pdf_kde_inner(sketch, num_points, x_min, x_max, bandwidth, weight_power)
+}
+
 #[pg_operator(immutable, parallel_safe)]
 #[opname(->)]
 pub fn arrow_tdigest_num_vals<'a>(sketch: TDigest<'a>, _accessor: AccessorNumVals) -> f64 {
@@ -1868,6 +1980,224 @@ mod tests {
         });
     }
 
+    // ─── single-centroid (NaN regression) tests ─────────────────────
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_weighted_single_centroid() {
+        Spi::connect_mut(|client| {
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, 200.0), 100, 0.0, 400.0, 3.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(pdf.len(), 100);
+            let sum: f64 = pdf.iter().sum();
+            assert!(
+                (sum - 100.0).abs() < 0.5,
+                "weighted single-centroid PDF sum = {sum}, expected 100"
+            );
+            let nonzero = pdf.iter().filter(|&&v| v > 0.0).count();
+            assert!(nonzero > 0, "should have at least one nonzero bin");
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_cdf_weighted_single_centroid() {
+        Spi::connect_mut(|client| {
+            let cdf_below = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, 200.0), 0.0, 3.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+            assert!(
+                (cdf_below - 0.0).abs() < 1e-10,
+                "CDF below single centroid should be 0, got {cdf_below}"
+            );
+
+            let cdf_at = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, 200.0), 200.0, 3.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+            assert!(
+                !cdf_at.is_nan(),
+                "CDF at centroid mean should not be NaN"
+            );
+
+            let cdf_above = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, 200.0), 999.0, 3.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+            assert!(
+                (cdf_above - 1.0).abs() < 1e-10,
+                "CDF above single centroid should be 1, got {cdf_above}"
+            );
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_cdf_percentile_consistency_single_centroid() {
+        Spi::connect_mut(|client| {
+            for q in [0.1, 0.5, 0.9] {
+                let cdf = client
+                    .update(
+                        &format!(
+                            "SELECT approx_cdf(
+                                approx_percentile({q}, tdigest(100, 200.0), 3.0),
+                                tdigest(100, 200.0),
+                                3.0
+                            )"
+                        ),
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .first()
+                    .get_one::<f64>()
+                    .unwrap()
+                    .unwrap();
+
+                assert!(
+                    !cdf.is_nan(),
+                    "single-centroid consistency at q={q} should not be NaN"
+                );
+                assert!(
+                    (cdf - 1.0).abs() < 0.01,
+                    "single-centroid cdf at q={q} should be ~1, got {cdf}"
+                );
+            }
+        });
+    }
+
+    #[pg_test]
+    fn test_approx_cdf_single_value() {
+        Spi::connect_mut(|client| {
+            let cdf_below = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, 42.0), 41.9)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+            assert!(
+                (cdf_below - 0.0).abs() < 1e-10,
+                "CDF below single value should be 0, got {cdf_below}"
+            );
+
+            let cdf_at = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, 42.0), 42.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+            assert!(
+                !cdf_at.is_nan(),
+                "CDF at single value should not be NaN"
+            );
+            assert!(
+                (cdf_at - 1.0).abs() < 0.01,
+                "CDF at single value should be ~1, got {cdf_at}"
+            );
+
+            let cdf_above = client
+                .update(
+                    "SELECT approx_cdf(tdigest(100, 42.0), 42.1)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<f64>()
+                .unwrap()
+                .unwrap();
+            assert!(
+                (cdf_above - 1.0).abs() < 1e-10,
+                "CDF above single value should be 1, got {cdf_above}"
+            );
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_to_pdf_out_of_range() {
+        Spi::connect_mut(|client| {
+            // Data is 1..100, query well outside that range
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 100, -1000.0, -900.0) \
+                    FROM (SELECT generate_series(1.0, 100.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(pdf.len(), 100);
+            let sum: f64 = pdf.iter().sum();
+            assert!(
+                (sum - 0.0).abs() < 1e-10,
+                "PDF left of data should sum to 0, got {sum}"
+            );
+
+            // Data is 1..100, query range covering data
+            let pdf_mid = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 100, 0.0, 200.0) \
+                    FROM (SELECT generate_series(1.0, 100.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let mid_sum: f64 = pdf_mid.iter().sum();
+            assert!(
+                (mid_sum - 100.0).abs() < 0.5,
+                "PDF covering data should sum to ~100, got {mid_sum}"
+            );
+        });
+    }
+
     #[pg_test]
     fn test_tdigest_to_pdf_weighted_consistency_with_histogram() {
         Spi::connect_mut(|client| {
@@ -1890,6 +2220,168 @@ mod tests {
             assert!(
                 nonzero > 50,
                 "weighted pdf should have >50 nonzero bins, got {nonzero}"
+            );
+        });
+    }
+
+    // ─── tdigest_to_pdf_kde tests ─────────────────────────────────
+
+    #[pg_test]
+    fn test_tdigest_kde_single_centroid() {
+        Spi::connect_mut(|client| {
+            // Use mean=199 so the centroid aligns with bin center (i=99: x=199 when dx=2)
+            let kde = client
+                .update(
+                    "SELECT tdigest_to_pdf_kde(tdigest(100, 199.0), 200, 0.0, 400.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(kde.len(), 200);
+            let sum: f64 = kde.iter().sum();
+            apx_eql(sum, 100.0, 3.0);
+
+            let max_bin = kde.iter().cloned().fold(0.0_f64, f64::max);
+            let max_idx = kde.iter().position(|&v| v == max_bin).unwrap_or(0);
+            assert!(
+                (max_idx as f64 - 99.0).abs() < 5.0,
+                "KDE max should be at bin ~99 (mean=199), got bin {max_idx}"
+            );
+
+            let kde_nonzero = kde.iter().filter(|&&v| v > 0.0).count();
+            assert!(
+                kde_nonzero > 20,
+                "KDE should spread beyond a single bin, got {kde_nonzero} nonzero"
+            );
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_kde_sum_equals_100() {
+        Spi::connect_mut(|client| {
+            let kde = client
+                .update(
+                    "SELECT tdigest_to_pdf_kde(tdigest(100, v), 200, -200.0, 600.0) \
+                    FROM (SELECT generate_series(1.0, 399.0, 1.0) AS v) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let sum: f64 = kde.iter().sum();
+            apx_eql(sum, 100.0, 0.5);
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_kde_smoothness() {
+        Spi::connect_mut(|client| {
+            let kde = client
+                .update(
+                    "SELECT tdigest_to_pdf_kde(tdigest(100, v), 200, 0.0, 400.0) \
+                    FROM (SELECT v FROM (SELECT random() * 100.0 AS v FROM generate_series(1, 10000)) sq) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let pdf = client
+                .update(
+                    "SELECT tdigest_to_pdf(tdigest(100, v), 200, 0.0, 400.0) \
+                    FROM (SELECT v FROM (SELECT random() * 100.0 AS v FROM generate_series(1, 10000)) sq) AS subq",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let kde_zero = kde.iter().filter(|&&v| v == 0.0).count();
+            let pdf_zero = pdf.iter().filter(|&&v| v == 0.0).count();
+            assert!(
+                kde_zero <= pdf_zero,
+                "KDE should have at most as many zero bins as PDF, got {kde_zero} vs {pdf_zero}"
+            );
+        });
+    }
+
+    #[pg_test]
+    fn test_tdigest_kde_bandwidth_param() {
+        Spi::connect_mut(|client| {
+            // Use mean=199 to align centroid with bin center (i=99: x=199 when dx=2)
+            let bw_auto = client
+                .update(
+                    "SELECT tdigest_to_pdf_kde(tdigest(100, 199.0), 200, 0.0, 400.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let bw_large = client
+                .update(
+                    "SELECT tdigest_to_pdf_kde(tdigest(100, 199.0), 200, 0.0, 400.0, 100.0)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            let bw_small = client
+                .update(
+                    "SELECT tdigest_to_pdf_kde(tdigest(100, 199.0), 200, 0.0, 400.0, 0.6)",
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .first()
+                .get_one::<Vec<f64>>()
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(bw_auto.len(), 200);
+            assert_eq!(bw_large.len(), 200);
+            assert_eq!(bw_small.len(), 200);
+
+            // bw_auto should sum to ~100 (auto bandwidth is reasonable for single centroid)
+            let sum_auto: f64 = bw_auto.iter().sum();
+            apx_eql(sum_auto, 100.0, 3.0);
+
+            // bw_large=100 leaks mass outside [0,400] (σ=100 captures Φ(2)-Φ(-2)≈95%)
+            // bw_small=2 is well-sampled at dx=2; neither extreme value is expected to sum to 100
+            // Instead verify relative peak shapes
+            let max_small = bw_small.iter().cloned().fold(0.0_f64, f64::max);
+            let max_auto = bw_auto.iter().cloned().fold(0.0_f64, f64::max);
+            let max_large = bw_large.iter().cloned().fold(0.0_f64, f64::max);
+
+            assert!(
+                max_small > max_auto,
+                "small bandwidth should give sharper peak ({max_small}) than auto ({max_auto})"
+            );
+            assert!(
+                max_auto > max_large,
+                "auto bandwidth should give sharper peak ({max_auto}) than large ({max_large})"
             );
         });
     }
